@@ -61,6 +61,7 @@
 #include "pa_util.h"
 #include "pa_allocation.h"
 #include "pa_hostapi.h"
+#include "pa_memorybarrier.h"
 #include "pa_stream.h"
 #include "pa_cpuload.h"
 #include "pa_process.h"
@@ -1047,7 +1048,39 @@ static void StreamProcessingCallback( void *userData )
 
         if( stream->hasOutput )
         {
-            sem_wait( &stream->outputStream->outputSem );
+            struct timespec abstime;
+            // Calculate the time needed to play all buffers, then add 500ms for spare room.
+            const int64_t millisecondsNeeded =
+                numberOfBuffers * ( 10000 * (int64_t)stream->framesPerHostCallback ) /
+                    ( (int64_t)stream->streamRepresentation.streamInfo.sampleRate ) +
+                500;
+
+            abstime.tv_nsec = timeSpec.tv_nsec + millisecondsNeeded * 1000000;
+            const int64_t remainder = abstime.tv_nsec % 1000000000;
+            abstime.tv_sec = timeSpec.tv_sec + ( abstime.tv_nsec - remainder ) / 1000000000;
+            abstime.tv_nsec = remainder;
+
+            int semaphoreResult = -1;
+            do
+            {
+                semaphoreResult = sem_timedwait( &stream->outputStream->outputSem, &abstime );
+            } while( semaphoreResult == -1 && errno == EINTR );  // Restart if interrupted by handler
+
+            if( semaphoreResult == -1 && errno == ETIMEDOUT)
+            {
+                // Android may get into a deadlock if underruns occur in which stream->outputSem
+                // will never wake up. Thus we use a timeout to restart the stream.
+                // See https://github.com/croissanne/portaudio_opensles/issues/15
+                // SLuint32 currState = 7777;
+                //(*stream->outputStream->playerItf)->GetPlayState( stream->outputStream->playerItf,
+                // &currState );
+                ( *stream->outputStream->playerItf )
+                    ->SetPlayState( stream->outputStream->playerItf, SL_PLAYSTATE_STOPPED );
+                ( *stream->outputStream->outputBufferQueueItf )
+                    ->Clear( stream->outputStream->outputBufferQueueItf );
+                ( *stream->outputStream->playerItf )
+                    ->SetPlayState( stream->outputStream->playerItf, SL_PLAYSTATE_PLAYING );
+            }
             PaUtil_SetOutputFrameCount( &stream->bufferProcessor, 0 );
             PaUtil_SetInterleavedOutputChannels( &stream->bufferProcessor, 0,
                                                  (void*) (stream->outputStream->outputBuffers)[stream->outputStream->currentOutputBuffer], 0 );
@@ -1097,9 +1130,14 @@ static void StreamProcessingCallback( void *userData )
 
         PaUtil_EndCpuLoadMeasurement( &stream->cpuLoadMeasurer, framesProcessed );
 
-        if( stream->doAbort )
+        const SLboolean bDoStop = stream->doStop;
+        const SLboolean bDoAbort = stream->doAbort;
+
+        PaUtil_FullMemoryBarrier();
+
+        if( bDoAbort )
             goto end;
-        if( framesProcessed == 0 && ( stream->doStop || PaUnixThread_StopRequested( &stream->streamThread ) ) )
+        if( framesProcessed == 0 && ( bDoStop || PaUnixThread_StopRequested( &stream->streamThread ) ) )
             goto end;
 
         if( callbackResult != paContinue )
